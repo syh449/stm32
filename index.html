@@ -1,0 +1,1095 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>指尖魔法 3D 粒子</title>
+  <style>
+    html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #000; }
+    canvas { display: block; }
+    #fullscreenBtn {
+      position: fixed;
+      top: 16px;
+      right: 16px;
+      z-index: 10;
+      background: rgba(255,255,255,0.15);
+      color: #fff;
+      border: 1px solid rgba(255,255,255,0.25);
+      padding: 8px 12px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      backdrop-filter: blur(6px);
+      transition: background 0.3s;
+    }
+    #fullscreenBtn:hover {
+      background: rgba(255,255,255,0.3);
+    }
+    #status {
+      position: fixed;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      color: rgba(255,255,255,0.8);
+      font-family: sans-serif;
+      font-size: 18px;
+      pointer-events: none;
+      text-align: center;
+      z-index: 5;
+    }
+    .spinner {
+      display: inline-block;
+      width: 40px;
+      height: 40px;
+      border: 3px solid rgba(255,255,255,0.3);
+      border-radius: 50%;
+      border-top-color: #fff;
+      animation: spin 1s ease-in-out infinite;
+      margin-bottom: 15px;
+    }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+    video { display: none; }
+  </style>
+</head>
+<body>
+  <div id="status">
+    <div class="spinner"></div>
+    <div>正在启动摄像头与AI模型...<br><span style="font-size:14px; opacity:0.6;">首次加载可能需要 10-30 秒</span></div>
+  </div>
+  <button id="fullscreenBtn">全屏</button>
+  <video id="inputVideo" playsinline style="display:none"></video>
+  <!-- 降级 Three.js 版本以增强兼容性 (WebGL 1/2) -->
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js"></script>
+  <!-- 
+     CDN: 回归更稳定的 jsdelivr，并添加详细的手动修复指引
+  -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1646424915/hands.min.js" 
+    crossorigin="anonymous"
+    onerror="alert('Error: 无法加载核心库 hands.min.js。请报错给开发者或检查网络。');"></script>
+
+  <script>
+    // 检查某些浏览器环境限制
+    if (window.location.protocol === 'file:') {
+       alert("注意：直接双击打开 HTML 文件可能导致摄像头或 AI 模型无法加载（浏览器安全限制）。\n建议使用 VS Code 的 'Live Server' 插件运行，或搭建本地服务器访问。");
+    }
+  
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x020205); // 深邃蓝黑
+    scene.fog = new THREE.FogExp2(0x020205, 0.0015); // 迷雾增加深度感
+
+    const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera.position.set(0, 0, 140);
+
+    let renderer;
+    try {
+        renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        document.body.appendChild(renderer.domElement);
+    } catch (e) {
+        showError("您的浏览器不支持 WebGL 或显卡驱动不兼容。<br>请尝试升级浏览器或显卡驱动。");
+        throw e;
+    }
+
+    // --- 全局粒子系统配置 ---
+    const PARTICLE_COUNT = 35000;
+    let particleSystem = null;
+    let particleAttributes = {
+        positions: null,  // Float32Array
+        targets: null,    // Float32Array
+        colors: null,     // Float32Array
+        baseColors: null, // Float32Array (新增：存储原本的颜色，用于光效计算)
+        sizes: null,      // Float32Array
+        velocities: null, // Float32Array (存储速度)
+        homes: null       // Float32Array (存储游荡的初始家园位置)
+    };
+    
+    // 状态机
+    let isFormingText = false;
+    let atmosphereGroup = null;
+
+    // 预先初始化纹理
+    const particleTexture = createCircleTexture();
+
+    // 初始化统一粒子系统
+    initParticleSystem();
+
+    function initParticleSystem() {
+      const geometry = new THREE.BufferGeometry();
+      
+      const positions = new Float32Array(PARTICLE_COUNT * 3);
+      const targets = new Float32Array(PARTICLE_COUNT * 3);
+      const colors = new Float32Array(PARTICLE_COUNT * 3);
+      const baseColors = new Float32Array(PARTICLE_COUNT * 3); // 新增
+      const sizes = new Float32Array(PARTICLE_COUNT);
+      const velocities = new Float32Array(PARTICLE_COUNT * 3); // CPU physics
+      const homes = new Float32Array(PARTICLE_COUNT * 3);
+      
+      const colorCheck = new THREE.Color();
+
+      for(let i = 0; i < PARTICLE_COUNT; i++) {
+        const i3 = i * 3;
+        
+        // 1. 生成初始"家园"位置 (Home) - 升级：梦幻银河螺旋 (Dream Galaxy)
+        // 使用对数螺旋方程
+        // 3 条悬臂
+        const armIndex = i % 3;
+        // 随机偏移
+        const randomOffset = Math.random() * 0.5 + 0.5; // 0.5 ~ 1.0
+        // 距离中心的角度
+        const spin = Math.random() * 4 * Math.PI; 
+        
+        // e^(0.2 * theta)
+        const radius = 60 * Math.pow(Math.E, 0.1 * spin) * randomOffset;
+        
+        // 基础角度 + 悬臂偏移 + 自旋转
+        const angle = spin + (armIndex * Math.PI * 2 / 3);
+        
+        const x = Math.cos(angle) * radius;
+        const y = (Math.random() - 0.5) * (radius * 0.4); // 扁平结构，但随半径变厚
+        const z = Math.sin(angle) * radius;
+
+        homes[i3] = x;
+        homes[i3+1] = y;
+        homes[i3+2] = z;
+
+        // 初始位置 = 家园位置
+        positions[i3] = x;
+        positions[i3+1] = y;
+        positions[i3+2] = z;
+
+        // 初始目标 = 家园位置
+        targets[i3] = x;
+        targets[i3+1] = y;
+        targets[i3+2] = z;
+
+        // 颜色：基于半径的渐变梦幻色 (Dreamy Gradient)
+        // 中心：金色/暖色 -> 边缘：青色/紫色
+        const distRatio = Math.min(1.0, radius / 400); 
+        
+        // 0.0 (中心) -> 1.0 (边缘)
+        // Hue: 0.1 (Gold) -> 0.6 (Sky Blue) -> 0.8 (Purple)
+        let hue;
+        if(distRatio < 0.2) hue = 0.1 + Math.random() * 0.05; // Gold
+        else if (distRatio < 0.6) hue = 0.5 + Math.random() * 0.1; // Blue/Cyan
+        else hue = 0.75 + Math.random() * 0.15; // Purple/Pink
+
+        colorCheck.setHSL(hue, 0.8, 0.6 + Math.random() * 0.3);
+        
+        colors[i3] = baseColors[i3] = colorCheck.r;
+        colors[i3+1] = baseColors[i3+1] = colorCheck.g;
+        colors[i3+2] = baseColors[i3+2] = colorCheck.b;
+
+        sizes[i] = Math.random() * 3.5 + 0.5; 
+        
+        velocities[i3] = 0;
+        velocities[i3+1] = 0;
+        velocities[i3+2] = 0;
+      }
+      
+      geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+      geometry.setAttribute('size', new THREE.BufferAttribute(sizes, 1));
+      
+      // 保存引用以便在 animate 中更新
+      particleAttributes.positions = positions;
+      particleAttributes.targets = targets;
+      particleAttributes.colors = colors;
+      particleAttributes.baseColors = baseColors; // 保存
+      particleAttributes.sizes = sizes;
+      particleAttributes.velocities = velocities;
+      particleAttributes.homes = homes;
+
+      const material = new THREE.PointsMaterial({
+        size: 1.5,
+        vertexColors: true,
+        transparent: true,
+        opacity: 0.9,
+        sizeAttenuation: true,
+        map: particleTexture,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false
+      });
+      
+      particleSystem = new THREE.Points(geometry, material);
+      scene.add(particleSystem);
+    }
+    
+    // --- 辅助函数 ---
+
+    function createCircleTexture() {
+      const size = 64;
+      const canvas = document.createElement('canvas');
+      canvas.width = canvas.height = size;
+      const ctx = canvas.getContext('2d');
+      
+      // 更加梦幻的辉光纹理
+      const centerX = size / 2;
+      const centerY = size / 2;
+      
+      // 核心亮斑
+      const gradient = ctx.createRadialGradient(centerX, centerY, 0, centerX, centerY, size / 2);
+      gradient.addColorStop(0, 'rgba(255, 255, 255, 1)');      // 核心极亮
+      gradient.addColorStop(0.2, 'rgba(255, 255, 255, 0.9)');  // 光晕内圈
+      gradient.addColorStop(0.5, 'rgba(255, 255, 255, 0.3)');  // 光晕外圈
+      gradient.addColorStop(1, 'rgba(0, 0, 0, 0)');            // 边缘透明
+
+      ctx.fillStyle = gradient;
+      ctx.fillRect(0, 0, size, size);
+      
+      // 十字星芒装饰 (Star Burst) - 开启梦幻星光
+      ctx.globalAlpha = 0.9;
+      ctx.fillStyle = '#FFFFFF';
+      
+      // 纵向光芒 (两头尖)
+      ctx.beginPath();
+      ctx.moveTo(centerX, centerY - size/2);
+      ctx.bezierCurveTo(centerX+1, centerY-5, centerX+1, centerY-5, centerX, centerY+size/2);
+      ctx.bezierCurveTo(centerX-1, centerY+5, centerX-1, centerY+5, centerX, centerY-size/2);
+      ctx.fill();
+
+      // 横向光芒
+      ctx.beginPath();
+      ctx.moveTo(centerX - size/2, centerY);
+      ctx.bezierCurveTo(centerX-5, centerY+1, centerX-5, centerY+1, centerX+size/2, centerY);
+      ctx.bezierCurveTo(centerX+5, centerY-1, centerX+5, centerY-1, centerX-size/2, centerY);
+      ctx.fill();
+
+      return new THREE.CanvasTexture(canvas);
+    }
+    
+    // 确保纹理创建后再初始化背景
+    // createBackgroundStars(); // 已移除，改用 initParticleSystem
+
+    function clearAll() {
+      // 这里的 clearAll 意味着"恢复游荡状态"
+      isFormingText = false;
+      
+      const targets = particleAttributes.targets;
+      const homes = particleAttributes.homes;
+      const colors = particleAttributes.colors;
+      const baseColors = particleAttributes.baseColors;
+      const colorHelper = new THREE.Color();
+      
+      for(let i=0; i < PARTICLE_COUNT; i++) {
+        const i3 = i*3;
+        // 目标设回家园
+        targets[i3] = homes[i3];
+        targets[i3+1] = homes[i3+1];
+        targets[i3+2] = homes[i3+2];
+        
+        // 恢复星空色
+        const rnd = Math.random();
+        // 重新着色逻辑
+        if(rnd > 0.7) { colorHelper.setHSL(0.6 + Math.random() * 0.1, 0.9, 0.7); }
+        else if (rnd > 0.4) { colorHelper.setHSL(0.8 + Math.random() * 0.1, 0.8, 0.7); }
+        else { colorHelper.setHSL(0.1 + Math.random() * 0.1, 0.8, 0.6); }
+
+        colors[i3] = baseColors[i3] = colorHelper.r;
+        colors[i3+1] = baseColors[i3+1] = colorHelper.g;
+        colors[i3+2] = baseColors[i3+2] = colorHelper.b;
+      }
+      particleSystem.geometry.attributes.color.needsUpdate = true;
+
+      if (atmosphereGroup) {
+        scene.remove(atmosphereGroup);
+        atmosphereGroup.traverse(obj => {
+          if (obj.geometry) obj.geometry.dispose();
+          if (obj.material) obj.material.dispose();
+        });
+        atmosphereGroup = null;
+      }
+    }
+    
+    // 生成文字并分配目标
+    function createTextParticles(text, colorHex = '#ffffff') {
+      isFormingText = true;
+      
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+      // 增大字号，使文字主体占据更多空间
+      const fontSize = 240; 
+      
+      ctx.font = `900 ${fontSize}px Arial`; // 使用最粗的字体 (900/Black)
+      const metrics = ctx.measureText(text);
+      canvas.width = Math.ceil(metrics.width + 100);
+      canvas.height = fontSize + 100;
+
+      ctx.font = `900 ${fontSize}px Arial`;
+      ctx.fillStyle = '#ffffff'; 
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.fillText(text, canvas.width / 2, canvas.height / 2);
+
+      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+      const textPoints = [];
+      
+      // 采样精度提高：步长从2改到1，像素级采样
+      // 这会生成巨量的点，保证文字极度致密
+      const step = 2; // 虽然设为1最密，但为了性能和粒子分配均衡，2 依然较好，因为字体变大了
+      
+      for (let y = 0; y < canvas.height; y += step) {
+        for (let x = 0; x < canvas.width; x += step) {
+          const index = (y * canvas.width + x) * 4 + 3; 
+          if (imageData[index] > 128) { // 只取不透明度较高部分，边缘更锐利
+             // 缩放系数调整：原来的0.4太大，改成0.25适应屏幕
+            const px = (x - canvas.width / 2) * 0.25; 
+            const py = (canvas.height / 2 - y) * 0.25;
+            const pz = (Math.random() - 0.5) * 5; // 压扁Z轴，让文字看起来更像"板"而不是圆柱，更清晰
+            textPoints.push({x: px, y: py, z: pz});
+          }
+        }
+      }
+      
+      const targets = particleAttributes.targets;
+      const homes = particleAttributes.homes;
+      const colors = particleAttributes.colors;
+      const baseColors = particleAttributes.baseColors;
+      const targetColor = new THREE.Color(colorHex);
+      const hsl = {};
+      targetColor.getHSL(hsl);
+      
+      // 打乱粒子索引，让聚合效果更随机
+      // 我们创建一个索引数组并shuffle它
+      const indices = new Uint32Array(PARTICLE_COUNT);
+      for(let i=0; i<PARTICLE_COUNT; i++) indices[i] = i;
+      // Fisher-Yates shuffle (partial)
+      for(let i=0; i<textPoints.length && i<PARTICLE_COUNT; i++) {
+          const r = i + Math.floor(Math.random() * (PARTICLE_COUNT - i));
+          const temp = indices[i];
+          indices[i] = indices[r];
+          indices[r] = temp;
+      }
+      
+      // 分配目标
+      const textLen = textPoints.length;
+      
+      // 如果文字点太少（防御），避免除零
+      if(textLen === 0) return;
+      
+      for(let i=0; i<PARTICLE_COUNT; i++) {
+          const idx = indices[i];
+          const i3 = idx * 3;
+          
+          // 循环利用文字点
+          const pointIndex = i % textLen;
+          const basePoint = textPoints[pointIndex];
+          
+          let tx = basePoint.x;
+          let ty = basePoint.y;
+          let tz = basePoint.z;
+          
+          // --- 美化图案逻辑 ---
+          // 将粒子分为三层：骨骼 (Core)、外壳 (Shell)、光晕 (Auara)
+          // 35000 粒子，文字点可能只有 3000-5000 个，所以很多粒子会重叠
+          
+          const isCore = i < textLen * 2.5; // 进一步增加核心粒子比例
+          const isShell = i >= textLen * 2.5 && i < textLen * 5; 
+          
+          if(isCore) {
+              // 1. 骨骼：极度致密
+              tx += (Math.random() - 0.5) * 0.8;
+              ty += (Math.random() - 0.5) * 0.8;
+              tz += (Math.random() - 0.5) * 2.0;
+              
+              // 颜色：核心亮，甚至发白
+              colors[i3] = baseColors[i3] = targetColor.r * 1.5;
+              colors[i3+1] = baseColors[i3+1] = targetColor.g * 1.5;
+              colors[i3+2] = baseColors[i3+2] = targetColor.b * 1.5;
+              
+          } else if (isShell) {
+              // 2. 外壳：稍微松散
+              const rDist = 1.0 + Math.random() * 3.0;
+              const angle = Math.random() * Math.PI * 2;
+              
+              tx += Math.cos(angle) * rDist;
+              ty += Math.sin(angle) * rDist;
+              tz += (Math.random() - 0.5) * 10.0; 
+              
+              colors[i3] = baseColors[i3] = targetColor.r;
+              colors[i3+1] = baseColors[i3+1] = targetColor.g;
+              colors[i3+2] = baseColors[i3+2] = targetColor.b;
+              
+          } else {
+              // 3. 光晕：作为背景，也尽量靠近文字，形成厚重的辉光而不是散乱的一团
+              const spread = 3.0 + Math.random() * 20.0; // 范围收缩一点，让形状更明显
+              const angle = Math.random() * Math.PI * 2;
+              
+              tx += Math.cos(angle) * spread;
+              ty += Math.sin(angle) * spread;
+              tz += (Math.random() - 0.5) * 40.0; 
+              
+              colors[i3] = baseColors[i3] = targetColor.r * 0.3;
+              colors[i3+1] = baseColors[i3+1] = targetColor.g * 0.3;
+              colors[i3+2] = baseColors[i3+2] = targetColor.b * 0.3;
+          }
+
+          targets[i3] = tx;
+          targets[i3+1] = ty;
+          targets[i3+2] = tz;
+          
+          // --- 螺旋收缩动画 (Spiral Implosion) ---
+          // 改为"慢速螺旋凝聚"
+          // 我们给予粒子一个巨大的"切向速度"（围绕中心旋转），而不是直接向内的速度
+          
+          const px = particleAttributes.positions[i3];
+          const py = particleAttributes.positions[i3+1];
+          const pz = particleAttributes.positions[i3+2];
+          
+          // 计算当前点到原点的水平距离（XZ平面）
+          const radius = Math.sqrt(px*px + pz*pz) || 1.0;
+          
+          // 切向向量：(-z, 0, x) 围绕Y轴旋转
+          // 归一化后 * 速度
+          
+          const spinSpeed = 4.0; // 旋转初速度
+          
+          const velocities = particleAttributes.velocities;
+          
+          // 螺旋速度：主要在XZ平面旋转，保留一点点Y轴随机
+          velocities[i3] = (-pz / radius) * spinSpeed + (Math.random()-0.5);
+          velocities[i3+1] = (Math.random()-0.5) * 2.0; 
+          velocities[i3+2] = (px / radius) * spinSpeed + (Math.random()-0.5);
+      }
+      
+      particleSystem.geometry.attributes.color.needsUpdate = true;
+    }
+
+
+    function spawnAtmosphere() {
+      if (atmosphereGroup) {
+        scene.remove(atmosphereGroup);
+      }
+      atmosphereGroup = new THREE.Group();
+      
+      // 1. 梦幻光环 (Rings)
+      // 创建几个旋转的轨道环
+      const ringCount = 3;
+      for(let i=0; i<ringCount; i++) {
+          const radius = 60 + i * 20;
+          const curve = new THREE.EllipseCurve(
+            0, 0,            // ax, aY
+            radius, radius,  // xRadius, yRadius
+            0, 2 * Math.PI,  // aStartAngle, aEndAngle
+            false,           // aClockwise
+            0                // aRotation
+          );
+          
+          const points = curve.getPoints(100);
+          const geometry = new THREE.BufferGeometry().setFromPoints(points);
+          // 倾斜环绕
+          const material = new THREE.LineBasicMaterial({
+             color: 0xffadc6 + i*0x001122, // 渐变粉
+             transparent: true,
+             opacity: 0.3
+          });
+          
+          const ring = new THREE.Line(geometry, material);
+          
+          // 随机旋转初始角度
+          ring.rotation.x = Math.PI / 2 + (Math.random()-0.5); 
+          ring.rotation.y = (Math.random()-0.5);
+          
+          ring.userData.rotSpeedX = (Math.random()-0.5) * 0.02;
+          ring.userData.rotSpeedY = (Math.random()-0.5) * 0.02;
+          ring.userData.rotSpeedZ = (Math.random()-0.5) * 0.05;
+          
+          atmosphereGroup.add(ring);
+      }
+
+      // 2. 漂浮的爱心光点 (Floating Hearts/Sparks)
+      const particleCount = 100;
+      const geom = new THREE.BufferGeometry();
+      const posArray = new Float32Array(particleCount * 3);
+      const speedArray = new Float32Array(particleCount); // Rising speed
+      
+      for(let i=0; i<particleCount; i++) {
+          posArray[i*3] = (Math.random() - 0.5) * 200;
+          posArray[i*3+1] = -100 + Math.random() * 200;
+          posArray[i*3+2] = (Math.random() - 0.5) * 100;
+          speedArray[i] = 0.2 + Math.random() * 0.5;
+      }
+      geom.setAttribute('position', new THREE.BufferAttribute(posArray, 3));
+      
+      // 简单用点材质，或者爱心贴图
+      const mat = new THREE.PointsMaterial({
+          color: 0xff6b6b,
+          size: 2.0,
+          transparent: true,
+          opacity: 0.6,
+          map: particleTexture, // 复用之前的
+          blending: THREE.AdditiveBlending,
+          depthWrite: false
+      });
+      
+      const sparks = new THREE.Points(geom, mat);
+      sparks.userData.speeds = speedArray;
+      atmosphereGroup.add(sparks);
+      
+      scene.add(atmosphereGroup);
+    }
+    
+    // 移除了 spawnBalloons 和 spawnFlowers
+    
+    // --- 辅助函数：颜色 ---
+    function randomPastel() {
+      const r = 200 + Math.floor(Math.random() * 55);
+      const g = 200 + Math.floor(Math.random() * 55);
+      const b = 200 + Math.floor(Math.random() * 55);
+      return new THREE.Color(`rgb(${r},${g},${b})`);
+    }
+
+    const ambient = new THREE.AmbientLight(0xffffff, 1.0);
+    const directional = new THREE.DirectionalLight(0xffffff, 0.8);
+    directional.position.set(0, 60, 80);
+    const pointLight = new THREE.PointLight(0xffaa00, 1, 100);
+    pointLight.position.set(0, 0, 50);
+    scene.add(ambient, directional, pointLight);
+
+    // --- 交互与环境系统 ---
+    let mouse = new THREE.Vector2(0, 0);
+    let targetCameraPos = new THREE.Vector2(0, 0);
+    
+    document.addEventListener('mousemove', (event) => {
+        mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+        mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+    });
+    
+    // 流星系统
+    const shootingStars = [];
+    const shootingStarMaterial = new THREE.LineBasicMaterial({
+        color: 0xffffff, 
+        transparent: true, 
+        opacity: 0.8,
+        blending: THREE.AdditiveBlending
+    });
+    
+    function createShootingStar() {
+        if(Math.random() > 0.08) return; // 提高生成概率 (0.03 -> 0.08)
+        
+        // 随机起点
+        const start = new THREE.Vector3(
+            (Math.random() - 0.5) * 300,
+            150 + Math.random() * 50,
+            (Math.random() - 0.5) * 100
+        );
+        // 随机终点 (划过屏幕)
+        const end = new THREE.Vector3(
+            start.x + (Math.random() - 0.5) * 100,
+            -150,
+            start.z + (Math.random() - 0.5) * 100
+        );
+        
+        const geometry = new THREE.BufferGeometry().setFromPoints([start, start]); // 初始长度为0
+        const line = new THREE.Line(geometry, shootingStarMaterial);
+        
+        scene.add(line);
+        shootingStars.push({ 
+            mesh: line, 
+            start: start, 
+            end: end, 
+            progress: 0, 
+            speed: 0.02 + Math.random() * 0.03 
+        });
+    }
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      const time = Date.now() * 0.001;
+      
+      // 1. 梦幻交互：相机视差 (Parallax)
+      // 相机随鼠标轻微晃动，增加沉浸感
+      targetCameraPos.x = mouse.x * 20;
+      targetCameraPos.y = mouse.y * 20;
+      
+      camera.position.x += (targetCameraPos.x - camera.position.x) * 0.02;
+      camera.position.y += (targetCameraPos.y - camera.position.y) * 0.02;
+      camera.lookAt(0, 0, 0);
+
+      // 2. 流星更新
+      createShootingStar();
+      for (let i = shootingStars.length - 1; i >= 0; i--) {
+          const s = shootingStars[i];
+          s.progress += s.speed;
+          
+          if (s.progress >= 1.5) { // 稍微延迟移除
+              scene.remove(s.mesh);
+              s.mesh.geometry.dispose();
+              shootingStars.splice(i, 1);
+              continue;
+          }
+          
+          // 更新尾迹
+          // 头部
+          const headT = Math.min(1, s.progress);
+          const head = new THREE.Vector3().lerpVectors(s.start, s.end, headT);
+          
+          // 尾部 (滞后)
+          const tailT = Math.max(0, s.progress - 0.15);
+          const tail = new THREE.Vector3().lerpVectors(s.start, s.end, tailT);
+          
+          s.mesh.geometry.setFromPoints([tail, head]);
+          s.mesh.geometry.attributes.position.needsUpdate = true;
+          
+          // 渐隐
+          if(s.progress > 0.8) {
+              s.mesh.material.opacity = 1 - ((s.progress - 0.8) * 5);
+          }
+      }
+      
+      if(particleSystem) {
+          const positions = particleAttributes.positions;
+          const targets = particleAttributes.targets;
+          const velocities = particleAttributes.velocities;
+          const colors = particleAttributes.colors;
+          const baseColors = particleAttributes.baseColors;
+          
+          for(let i=0; i<PARTICLE_COUNT; i++) {
+              const i3 = i*3;
+              
+              const px = positions[i3];
+              const py = positions[i3+1];
+              const pz = positions[i3+2];
+              
+              const tx = targets[i3];
+              const ty = targets[i3+1];
+              const tz = targets[i3+2];
+              
+              let vx = velocities[i3];
+              let vy = velocities[i3+1];
+              let vz = velocities[i3+2];
+              
+              // 物理逻辑：追求"自然、不弹、顺滑"
+              // 使用强阻尼 + 适中拉力，模拟磁性吸附而不是弹簧振荡
+              
+              const dx = tx - px;
+              const dy = ty - py;
+              const dz = tz - pz;
+              
+              const distSq = dx*dx + dy*dy + dz*dz;
+              
+              // 拉力系数 (stiffness)：
+              // 为了避免弹簧震荡(Bounce)，我们使用较低的刚度，但配合高阻尼
+              const k = 0.015; 
+              
+              vx += dx * k;
+              vy += dy * k;
+              vz += dz * k;
+              
+              // 2. 梦幻流体场 (Dream Fluid Field)
+              // 区分两种状态：银河流动 vs 文字微动
+              
+              if (!isFormingText) {
+                  // --- 银河状态 (Galaxy Idle) ---
+                  // 增加漩涡动力，让它像星系一样缓慢旋转流淌
+                  // 计算当前粒子的极坐标角度
+                  const angle = Math.atan2(pz, px);
+                  const radius = Math.sqrt(px*px + pz*pz);
+                  
+                  // 漩涡力：使得粒子沿着切线方向运动
+                  // 核心转得快，边缘转得慢
+                  const spinSpeed = 0.05 * (200.0 / (radius + 50.0));
+                  
+                  // 切线方向: (-sin, 0, cos)
+                  vx += -Math.sin(angle) * spinSpeed;
+                  vz += Math.cos(angle) * spinSpeed;
+                  
+                  // 垂直起伏 (Vertical Bobbing)
+                  vy += Math.sin(time * 0.5 + radius * 0.05) * 0.02;
+                  
+                  // 少量随机湍流 (Turbulence)
+                  const noiseScale = 0.005;
+                  vx += Math.sin(py * noiseScale + time) * 0.02;
+                  vz += Math.cos(py * noiseScale + time) * 0.02;
+                  
+              } else {
+                  // --- 文字状态 (Text Active) ---
+                  // 保持原来的微动，甚至更微妙，像水中倒影
+                  const freq = 1.0;
+                  const amp = 0.008; // 稍微减小幅度，增加精致感
+                  
+                  vx += Math.sin(time * freq + py * 0.05) * amp;
+                  vy += Math.cos(time * freq + px * 0.05) * amp;
+                  vz += Math.sin(time * freq + pz * 0.05) * amp;
+              }
+
+              // 3. 鼠标交互 (Mouse Interaction) - 增加"指尖扰动"
+              // 将鼠标屏幕坐标映射到大概的世界平面
+              const mouseWorldX = mouse.x * 250;
+              const mouseWorldY = mouse.y * 200;
+              
+              // 计算粒子到鼠标光标的距离 (仅XY平面)
+              const dxM = px - mouseWorldX;
+              const dyM = py - mouseWorldY;
+              const distMouseSq = dxM*dxM + dyM*dyM;
+              
+              // 如果鼠标在附近，产生斥力 (像拨开水面)
+              // 半径约 80
+              if (distMouseSq < 6400) { 
+                  const distM = Math.sqrt(distMouseSq);
+                  const force = (1.0 - distM / 80.0) * 1.5; // 力度系数
+                  
+                  vx += (dxM / distM) * force;
+                  vy += (dyM / distM) * force;
+              }
+
+              // 3. 自适应阻尼 (Adaptive Damping) - 解决"凝聚后不反弹"的关键
+              // 原理：距离远时阻尼低(允许旋转)，距离近时阻尼极高(像陷入泥潭)
+              
+              let damping = 0.96; // 默认低阻尼，保持旋转动量
+              
+              if (distSq < 400.0) { // 距离小于20时 (20^2 = 400)
+                  // 逐渐接近临界阻尼
+                  // 距离越近，阻尼越大
+                  // distSq=0 -> damping ~0.80
+                  // distSq=400 -> damping ~0.96
+                  const factor = distSq / 400.0;
+                  damping = 0.8 + (0.16 * factor);
+              }
+              
+              vx *= damping;
+              vy *= damping;
+              vz *= damping;
+              
+              positions[i3] += vx;
+              positions[i3+1] += vy;
+              positions[i3+2] += vz;
+              
+              velocities[i3] = vx;
+              velocities[i3+1] = vy;
+              velocities[i3+2] = vz;
+
+              // --- 增加光影效果 (升级版：Dream FX) ---
+              if (baseColors) {
+                 // 基础亮度
+                 let brightness = 1.0;
+                 
+                 // 1. 有机微闪烁 (Organic Twinkle)
+                 // 使用两个不同频率的正弦波叠加，让闪烁不那么机械
+                 const twinkle = Math.sin(time * 2.0 + i) * 0.5 + Math.sin(time * 5.0 + i * 0.1) * 0.5;
+                 brightness += twinkle * 0.2;
+                 
+                 // 2. 扫光波 (Scan Wave) - 仅在形成文字时
+                 if (isFormingText) {
+                    const wavePhase = (time * 1.5) % (Math.PI * 2); 
+                    const xPhase = px * 0.02; 
+                    const wave = Math.sin(wavePhase + xPhase);
+                    const highlight = Math.pow(Math.max(0, wave), 8.0) * 0.8; 
+                    brightness += highlight;
+                 }
+                 
+                 // 3. 动态色彩偏移 (Chroma Shift) - 新增
+                 // 让颜色随着时间在 HSV 空间微微旋转，产生"活的"色彩
+                 // 计算这个粒子的独特偏移
+                 let r = baseColors[i3];
+                 let g = baseColors[i3+1];
+                 let b = baseColors[i3+2];
+                 
+                 // 如果不在形成文字（在银河模式），则允许色彩流转
+                 if (!isFormingText) {
+                    // 简单的 RGB 通道混合模拟色相偏移
+                    const shift = Math.sin(time * 0.5 + px * 0.01) * 0.1;
+                    r += shift;
+                    b -= shift;
+                 }
+                 
+                 colors[i3] = Math.min(1.0, Math.max(0, r * brightness));
+                 colors[i3+1] = Math.min(1.0, Math.max(0, g * brightness));
+                 colors[i3+2] = Math.min(1.0, Math.max(0, b * brightness));
+              }
+          }
+          particleSystem.geometry.attributes.position.needsUpdate = true;
+          particleSystem.geometry.attributes.color.needsUpdate = true;
+          
+          // 整体旋转
+          // 如果是文字模式：微呼吸
+          // 如果是银河模式：持续自旋
+          if (isFormingText) {
+             particleSystem.rotation.y = Math.sin(time * 0.05) * 0.03;
+             particleSystem.rotation.x = Math.cos(time * 0.15) * 0.05;
+          } else {
+             // 银河自旋
+             particleSystem.rotation.y += 0.0005; // 缓慢但持续
+             particleSystem.rotation.x = Math.sin(time * 0.1) * 0.02; // 微小倾角变化
+          }
+      }
+
+      if (atmosphereGroup) {
+        atmosphereGroup.children.forEach(child => {
+             // 如果是光环 (Line)
+             if(child.isLine) {
+                 child.rotation.x += child.userData.rotSpeedX;
+                 child.rotation.y += child.userData.rotSpeedY;
+                 child.rotation.z += child.userData.rotSpeedZ;
+             }
+             // 如果是粒子 (Points)
+             if(child.isPoints) {
+                 const positions = child.geometry.attributes.position.array;
+                 const speeds = child.userData.speeds;
+                 for(let i=0; i<speeds.length; i++) {
+                     positions[i*3+1] += speeds[i]; // y 上升
+                     // 循环
+                     if(positions[i*3+1] > 120) {
+                         positions[i*3+1] = -120;
+                     }
+                     // 摇晃
+                     positions[i*3] += Math.sin(time + i) * 0.1;
+                 }
+                 child.geometry.attributes.position.needsUpdate = true;
+             }
+        });
+      }
+
+      renderer.render(scene, camera);
+    }
+    animate();
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    document.getElementById('fullscreenBtn').addEventListener('click', () => {
+      if (!document.fullscreenElement) {
+        document.documentElement.requestFullscreen().catch(() => {});
+      } else {
+        document.exitFullscreen().catch(() => {});
+      }
+    });
+
+    const videoElement = document.getElementById('inputVideo');
+    const statusElement = document.getElementById('status');
+
+    function updateStatus(msg) {
+        if(statusElement) statusElement.innerHTML = `<div class="spinner"></div><div>${msg}</div>`;
+    }
+
+    function showError(msg) {
+        if(statusElement) statusElement.innerHTML = `<div style="color:#ff6b6b">⚠️ ${msg}</div>`;
+        console.error(msg);
+    }
+
+    // 全局错误捕获，直接显示在屏幕上，方便排查
+    window.onerror = function(msg, url, line, col, error) {
+       showError(`System Error: ${msg}<br><small>${url}:${line}</small>`);
+       return false;
+    };
+
+    /* ----------------------------------------------------------------
+       2. 初始化 MediaPipe Hands
+    ------------------------------------------------------------------ */
+    if (typeof Hands === 'undefined') {
+        showError("核心组件加载失败。<br>请检查网络并刷新页面");
+        throw new Error("Hands library not loaded");
+    }
+
+    updateStatus("正在连接 AI 服务...<br><span style='font-size:12px;opacity:0.7'>(依赖 jsdelivr CDN，请耐心等待)</span>");
+
+    // 超时检测: 20秒没反应则报错
+    const loadTimeout = setTimeout(() => {
+        if (!isLoaded && statusElement && statusElement.style.display !== 'none') {
+             updateStatus("加载响应超时。<br>网络连接缓慢，请尝试刷新。");
+        }
+    }, 20000);
+
+    const hands = new Hands({
+      locateFile: (file) => {
+        // 使用相对路径检测：如果本地存在文件，优先用本地的（方便用户手动下载修复）
+        // 这里只是简单的 fallback 逻辑：总是返回网络路径，但在 UI 上提示用户
+        return `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1646424915/${file}`;
+      }
+    });
+
+    hands.setOptions({
+      maxNumHands: 1,
+      modelComplexity: 1,
+      minDetectionConfidence: 0.7,
+      minTrackingConfidence: 0.7
+    });
+
+    // 显式初始化，以便捕获早期错误
+    hands.initialize().then(() => {
+        console.log("Hands initialized successfully");
+        updateStatus("AI 内核初始化完成");
+    }).catch(err => {
+        console.error("Hands init error:", err);
+        showManualDownloadUI(err);
+    });
+
+    function showManualDownloadUI(err) {
+        if(!statusElement) return;
+        statusElement.style.pointerEvents = "auto"; // 允许点击
+        statusElement.style.background = "rgba(0,0,0,0.8)";
+        statusElement.style.padding = "20px";
+        statusElement.style.borderRadius = "10px";
+        statusElement.innerHTML = `
+            <div style="color:#ff6b6b;font-weight:bold;margin-bottom:10px">AI加载失败 (网络问题)</div>
+            <div style="font-size:12px;text-align:left;line-height:1.5;">
+                您的网络无法下载 AI 模型文件。<br>
+                报错信息: ${err.message}<br><br>
+                <strong>解决方案：</strong><br>
+                1. 尝试更换网络(手机热点)或关闭/开启代理。<br>
+                2. <strong>如果因为 Edge 浏览器 "Tracking Prevention" 报错：</strong><br>
+                   请在地址栏输入 <em>edge://settings/privacy</em>，将"跟踪防护"改为"基本"或暂时关闭。<br><br>
+            </div>
+            <button onclick="location.reload()" style="padding:5px 15px;margin-top:10px;cursor:pointer">重试</button>
+        `;
+    }
+
+    let lastGesture = null;
+    let isLoaded = false;
+
+    hands.onResults(results => {
+      // 首次成功识别到结果（哪怕是空结果，说明管线通了）
+      if (!isLoaded) {
+        clearTimeout(loadTimeout);
+        isLoaded = true;
+        updateStatus("AI 就绪！请伸出手指");
+        if(statusElement) {
+            // 延迟淡出，让用户看到"就绪"
+            setTimeout(() => {
+                statusElement.style.transition = 'opacity 0.5s';
+                statusElement.style.opacity = '0';
+                setTimeout(() => { statusElement.style.display = 'none'; }, 500);
+            }, 500);
+        }
+      }
+
+      const landmarks = results.multiHandLandmarks && results.multiHandLandmarks.length > 0 
+          ? results.multiHandLandmarks[0] : null;
+
+      if (!landmarks) return;
+
+      const handedness = results.multiHandedness && results.multiHandedness[0] ? results.multiHandedness[0].label : 'Right';
+      const count = countFingers(landmarks, handedness);
+
+      if (count !== lastGesture) {
+        lastGesture = count;
+        if (count === 0) {
+          clearAll();
+        } else if (count === 1) {
+          clearAll();
+          createTextParticles('1', '#9efcff');
+        } else if (count === 2) {
+          clearAll();
+          createTextParticles('2', '#ffd2ff');
+        } else if (count === 3) {
+          clearAll();
+          createTextParticles('3', '#fff59e');
+        } else if (count === 5) {
+          clearAll();
+          createTextParticles('I ❤ U', '#ff8b8b');
+          spawnAtmosphere();
+        }
+      }
+    });
+
+    /* ----------------------------------------------------------------
+       3. 启动摄像头 & 循环
+    ------------------------------------------------------------------ */
+    async function startCamera() {
+      try {
+        updateStatus("正在请求摄像头权限...");
+        
+        // 优先使用前置摄像头
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            width: { ideal: 640 },
+            height: { ideal: 480 },
+            facingMode: 'user'
+          }
+        });
+        
+        videoElement.srcObject = stream;
+        
+        // 等待视频元数据加载
+        await new Promise((resolve) => {
+           videoElement.onloadedmetadata = () => {
+             videoElement.play(); 
+             resolve();
+           };
+        });
+
+        updateStatus("AI 模型加载中...");
+        processVideo(); 
+        
+      } catch (err) {
+        showError("无法启动摄像头：" + err.message + "<br>请检查浏览器权限设置");
+      }
+    }
+
+    async function processVideo() {
+        if (videoElement.paused || videoElement.ended) {
+            requestAnimationFrame(processVideo);
+            return;
+        }
+
+        // 确保视频尺寸有效，否则MediaPipe会报错或卡死
+        if (videoElement.videoWidth === 0 || videoElement.videoHeight === 0) {
+            requestAnimationFrame(processVideo);
+            return;
+        }
+
+        try {
+            await hands.send({ image: videoElement });
+        } catch (error) {
+            console.error("Mediapipe error:", error);
+        }
+        
+        requestAnimationFrame(processVideo);
+    }
+    
+    startCamera();
+
+    function countFingers(lm, handedness) {
+      // handedness: "Right" means user's right hand (if back camera)
+      // or mirrored left hand (if front camera default mirror).
+      // Logic for thumb depends on handedness.
+      const isRight = handedness === 'Right';
+
+      const thumbTip = lm[4];
+      const thumbIp = lm[3];
+      const indexTip = lm[8];
+      const indexPip = lm[6];
+      const middleTip = lm[12];
+      const middlePip = lm[10];
+      const ringTip = lm[16];
+      const ringPip = lm[14];
+      const pinkyTip = lm[20];
+      const pinkyPip = lm[18];
+
+      let count = 0;
+
+      // Thumb logic
+      // Right hand: thumb moves left (x decreases) to open? 
+      // Actually standard MP Right hand: Thumb is on left side of palm.
+      // x increases to right.
+      // If palm faces camera:
+      // Right hand thumb tip x < thumb ip x  (if thumb is on left side)
+      // BUT, usually "Right" label from MP means it thinks it is a right hand.
+      // Let's stick to the previous simple logic or refine it.
+      // Previous logic: if (isRight) { if (thumbTip.x > thumbIp.x) count++; }
+      // This implies thumb tip is to the right of the knuckle.
+      
+      if (isRight) {
+        if (thumbTip.x > thumbIp.x) count++;
+      } else {
+        if (thumbTip.x < thumbIp.x) count++;
+      }
+
+      // Fingers: y is down in screen coords. Tip y < Pip y means finger is up.
+      if (indexTip.y < indexPip.y) count++;
+      if (middleTip.y < middlePip.y) count++;
+      if (ringTip.y < ringPip.y) count++;
+      if (pinkyTip.y < pinkyPip.y) count++;
+
+      return count;
+    }
+  </script>
+</body>
+</html>
